@@ -1,0 +1,105 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Sample Billing & Pets API", "version": "1.0.0" },
+  "servers": [{ "url": "https://api.example.com" }],
+  "paths": {
+    "/v1/users/{id}/billing": {
+      "get": {
+        "operationId": "getUserBillingHistory",
+        "summary": "Fetch invoicing statements for a user",
+        "description": "Returns the paginated billing and invoice history for the given account.",
+        "tags": ["Finance"],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "The unique account identifier" },
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer" }, "description": "Pagination length limit" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Billing history",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "invoices": { "type": "array", "items": { "$ref": "#/components/schemas/Invoice" } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/users": {
+      "get": {
+        "operationId": "listUsers",
+        "summary": "List all user accounts",
+        "description": "Returns a collection of user account profiles.",
+        "tags": ["Accounts"],
+        "parameters": [
+          { "name": "page", "in": "query", "required": false, "schema": { "type": "integer" } }
+        ]
+      },
+      "post": {
+        "operationId": "createUser",
+        "summary": "Create a new user account",
+        "description": "Registers a new user profile in the system.",
+        "tags": ["Accounts"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["email"],
+                "properties": {
+                  "email": { "type": "string", "description": "Account email address" },
+                  "name": { "type": "string", "description": "Display name" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/pets/{petId}": {
+      "get": {
+        "operationId": "getPetById",
+        "summary": "Get a pet by its identifier",
+        "description": "Fetches the details of a single pet.",
+        "tags": ["Pets"],
+        "parameters": [
+          { "name": "petId", "in": "path", "required": true, "schema": { "type": "string" } }
+        ]
+      }
+    },
+    "/v1/system/alerts": {
+      "get": {
+        "operationId": "fetchSystemAlerts",
+        "summary": "Fetch active system alerts",
+        "description": "Returns currently active operational alerts and warnings.",
+        "tags": ["Monitoring"]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Invoice": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "amount": { "type": "number" },
+          "status": { "type": "string" },
+          "customer": { "$ref": "#/components/schemas/Customer" }
+        }
+      },
+      "Customer": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "specrouter"
+version = "0.1.0"
+description = "Zero-ML, infrastructure-free MCP server that turns massive OpenAPI/Swagger specs into two dynamic LLM tools via in-memory BM25F + Jaccard + Levenshtein + RRF retrieval."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Prabhukiran Ganapavarapu" }]
+keywords = ["mcp", "openapi", "swagger", "bm25", "llm", "tools", "retrieval"]
+dependencies = [
+    "mcp>=1.2.0",
+    "httpx>=0.27",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+# Optional accelerator: only the Levenshtein (fuzzy) stage uses it; results are identical
+# whether or not rapidfuzz is installed. Default install stays pure-stdlib / infra-free.
+fast = ["rapidfuzz>=3.0"]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.23", "mcp[cli]>=1.2.0"]
+
+# Optional AI description enrichment (build-time only). Pick the provider you use;
+# the runtime stays zero-ML — enrichment never runs during discovery/execution.
+ai = ["langchain>=0.3"]
+ai-openai = ["langchain>=0.3", "langchain-openai>=0.2"]
+ai-anthropic = ["langchain>=0.3", "langchain-anthropic>=0.2"]
+ai-google = ["langchain>=0.3", "langchain-google-genai>=2.0"]
+ai-ollama = ["langchain>=0.3", "langchain-ollama>=0.2"]
+ai-all = [
+    "langchain>=0.3",
+    "langchain-openai>=0.2",
+    "langchain-anthropic>=0.2",
+    "langchain-google-genai>=2.0",
+    "langchain-ollama>=0.2",
+]
+
+[project.scripts]
+specrouter = "specrouter.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+specrouter = ["py.typed", "icon.svg"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
