@@ -489,9 +489,7 @@ skipped automatically when `rapidfuzz` is not installed.
 
 ## Demo
 
-**[▶ Watch the demo](demo/demo_specrouter.mp4)**
-
-> Click the link above — GitHub renders an inline video player for `.mp4` files.
+https://github.com/user-attachments/assets/0a85342d-b90e-4640-8cd7-1e05378f19ed
 
 ## Author
 
