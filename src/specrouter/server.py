@@ -18,6 +18,7 @@ from . import executor
 from .config import Settings, load_settings
 from .discovery import discover
 from .index import ensure_index
+from .logging_setup import configure_logging
 from .models import IndexBundle
 
 
@@ -68,14 +69,21 @@ def discover_tools(query: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def execute_tool(path: str, method: str, arguments: dict[str, Any] | None = None) -> str:
+async def execute_tool(path: str, method: str, arguments: dict[str, Any] | None = None) -> str:
     """Execute a discovered endpoint against the live API.
 
     ``path``/``method`` come from a discover_tools result; ``arguments`` is a flat
     key-value object mapped to path substitutions, query params, headers, and body.
+
+    Async so the up-to-``request_timeout`` upstream call is awaited off the event loop —
+    FastMCP runs sync tools inline, so a blocking call here would stall every other
+    connected client in HTTP hosting. A slow/unreachable upstream returns a structured
+    504/502 rather than hanging.
     """
     _ensure_ready()
-    return executor.execute_to_json(path, method, arguments, _state.bundle, _state.settings)
+    return await executor.execute_to_json_async(
+        path, method, arguments, _state.bundle, _state.settings
+    )
 
 
 @mcp.tool()
@@ -94,6 +102,7 @@ def refresh_index() -> dict[str, Any]:
 def init_state(settings: Settings | None = None) -> None:
     """Load settings and ensure the index is built/loaded before serving."""
     _state.settings = settings or load_settings()
+    configure_logging(_state.settings)
     _state.bundle = ensure_index(_state.settings)
 
 

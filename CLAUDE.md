@@ -42,18 +42,21 @@ it single-digit ms. Tunable via `SPECROUTER_FUZZY_*`; disable with `SPECROUTER_F
 | `tokenizer.py` | 4-step regex normalization (CamelCase split, separator cleanse, lowercase, stop-words). |
 | `models.py` | `EndpointRecord`, `Parameter`, `IndexBundle` dataclasses. |
 | `parser.py` | OpenAPI `paths -> {verb}` flatten, local `$ref` resolution, primes per-field token bags; `_extract_output_schema`/`_inline_schema` build the depth-capped `outputSchema`. |
+| `adapters/` | Source adapters (ingest types). `base.py`: `SourceResult` + `SourceAdapter` Protocol + `resolve_adapter`. `openapi.py`: default (fetch+`parse_spec`). `custom.py`: config-driven HTML scraper (bs4+lxml, rules file). Selected by `SPECROUTER_SOURCE_ADAPTER` (`openapi`/`custom`/`module:callable`). |
 | `enrichment.py` | Opt-in build-time LLM rewrite of descriptions (LangChain `init_chat_model`); per-endpoint hash cache; replaces `description` + re-primes so retrieval ranks on it. |
+| `scaffold.py` | `init-rules`: LLM-generates a `custom` rules file from a sample doc page (reuses `enrichment._build_model`), then dry-runs via `custom._parse_page`. LLM used once; runtime scraping stays deterministic. |
 | `engines/bm25f.py` | Fielded BM25; `prime()` precomputes corpus stats + length-bucketed vocab; `score()` per query with optional fuzzy term expansion (`_expand_terms`). |
 | `engines/jaccard.py` | Token-set intersection-over-union. |
 | `engines/levenshtein.py` | DP edit distance (+ optional rapidfuzz); `1/(1+dist)` similarity. |
 | `engines/rrf.py` | Rank fusion, `k=60`, tie-aware ranking. |
 | `fetcher.py` | Fetch spec from URL/`file://`; SHA-256 hash + ETag/Last-Modified capture; HEAD probe. |
-| `index.py` | `build_index`, `save_index`/`load_index` (pickle + JSON meta), and **`ensure_index`** (the one shared build/persist/staleness path). |
+| `index.py` | `build_index(settings, SourceResult)`, `save_index`/`load_index` (pickle + JSON meta), and **`ensure_index`** (the one shared path — drives the build through the selected source adapter). |
 | `discovery.py` | `discover_tools`: run engines → RRF → emit MCP tool schemas with separate `inputSchema` + `outputSchema` (usecase.md §4 Tool 1). |
-| `executor.py` | `execute_tool`: classify args into path/query/header/body, apply auth, httpx call, wrap result. Base URL = `settings.base_url or bundle.base_url` (env override wins at execution time). |
+| `executor.py` | `execute_tool`: classify args into path/query/header/body, apply auth, httpx call, wrap result. Pure prep (`_prepare`) + result wrap (`_finalize`) are shared by the **sync** (`execute`/`execute_to_json`, used by CLI/tests) and **async** (`execute_async`/`execute_to_json_async`, used by the MCP tool) paths so they can't drift. Base URL = `settings.base_url or bundle.base_url` (env override wins at execution time). `_CredScopedMixin` (one override, since `_redirect_headers` is on `httpx.BaseClient`) backs both `_CredScopedClient`/`_CredScopedAsyncClient`: follows redirects but drops the api-key header + `extra_headers` on cross-origin hops (httpx only strips `Authorization`/`Cookie`). Granular `settings.request_timeouts()` = `httpx.Timeout(request_timeout, connect=connect_timeout)` (httpx has **no** single total deadline). `execute_to_json[_async]` never raise — they map exceptions via `_map_exc` to a structured `{status, error, content}` (400 invalid request / 504 timeout / 502 upstream / 500 unexpected incl. `InvalidURL` + auth-plugin errors), while genuine upstream 4xx/5xx pass through with their real status. |
 | `auth.py` | Resolve auth mode → httpx kwargs; `none/bearer/api_key/basic/custom/plugin`. |
 | `server.py` | FastMCP wiring; `_state` holds the live bundle (swapped on refresh); `run()` supports `stdio` / `streamable-http` / `sse`; advertises the bundled `icon.svg` as a data-URI `Icon` (defensive — skipped on older SDKs). |
-| `cli.py` | `specrouter index | serve | refresh`; `serve` takes `--transport/--host/--port` for remote hosting. |
+| `cli.py` | `specrouter index | serve | refresh | init-rules`; `serve` takes `--transport/--host/--port`; `init-rules <url>` scaffolds custom rules (uses `load_settings(require_spec_source=False)`). Each command calls `configure_logging(settings)` after `load_settings`. |
+| `logging_setup.py` | `configure_logging(settings)` (idempotent) attaches a `RotatingFileHandler` to the `specrouter` parent logger → `<log_dir>/specrouter.log`. File + optional **stderr** only, **never stdout**. Steps log via `logging.getLogger(__name__)` in `index`/`enrichment`/`discovery`/`executor`. Configured by `SPECROUTER_LOG_*`. See `docs/LOGGING.md`. |
 
 ## Where the retrieval math lives
 All formulas, field weights (`W_c`/`b_c`), `k1`, RRF `k=60`, and the `"usrs biling"` typo example come
@@ -76,7 +79,8 @@ Required: `SPECROUTER_SPEC_URL`. Common: `SPECROUTER_BASE_URL`, `SPECROUTER_CACH
 matching credential vars (see README). Output schema: `SPECROUTER_INCLUDE_OUTPUT_SCHEMA`,
 `SPECROUTER_OUTPUT_SCHEMA_MAX_DEPTH`. Enrichment: `SPECROUTER_ENRICH` +
 `SPECROUTER_ENRICH_PROVIDER|MODEL|BASE_URL|API_KEY|CONCURRENCY|MAX_SENTENCES`. Index cache + meta sidecar +
-enrich cache are keyed by a hash of the spec URL.
+enrich cache are keyed by a hash of the spec URL. Logging:
+`SPECROUTER_LOG_DIR|LEVEL|MAX_BYTES|BACKUP_COUNT|CONSOLE|ARGS` (rotating `logs/specrouter.log`).
 
 `config.load_settings` auto-loads a `.env` file (`./.env` or `$SPECROUTER_ENV_FILE`) via `_apply_dotenv`;
 real env vars override file values. The loader reads with `utf-8-sig` to tolerate BOMs (PowerShell/editors).
@@ -90,11 +94,14 @@ fronted by HTTPS+auth or network-restricted (documented in README "Remote hostin
 
 ## Tests
 ```bash
-pytest          # 47 tests; ~1s
+pytest          # 85 core tests; ~3s (+2 demo guard tests when the [demo] extra is installed)
 ```
 `tests/conftest.py` builds an in-memory bundle from `sample/petstore.json` (no network). Executor tests mock
 httpx via `MockTransport`. Output-schema tests live in `test_output_schema.py`; enrichment tests in
 `test_enrichment.py` monkeypatch `enrichment._build_model` with a fake LLM (no network, no provider deps).
+`test_demo_catalog.py` (`pytest.importorskip("fastapi")`) guards the local demo API in `demo/` — the
+runnable FastAPI "Acme Product Catalog" (~100 endpoints) used to record a live SpecRouter session
+(`demo/README.md`); it's never imported by the core package.
 The rapidfuzz parity test auto-skips when the `[fast]` extra isn't installed.
 
 ## Gotchas
@@ -102,7 +109,19 @@ The rapidfuzz parity test auto-skips when the `[fast]` extra isn't installed.
   stop-word set — method routing is structural, not lexical.
 - `EndpointRecord.field_tokens` keys must stay aligned with `config.DEFAULT_FIELD_WEIGHTS` / `FIELD_NAMES`.
 - Bump `index.INDEX_FORMAT_VERSION` whenever the pickled `IndexBundle` layout changes (invalidates caches);
-  currently `3` (v2 added `output_schema`/`ai_enriched`; v3 changed base-URL resolution).
+  currently `4` (v2 added `output_schema`/`ai_enriched`; v3 changed base-URL resolution; v4 = source adapters).
+- **Never name the doc-ingestion adapter after a vendor** (e.g. "nitro") — it is the generic `custom` adapter.
+- **Logging never goes to stdout.** The stdio MCP transport owns stdout; `logging_setup` writes to the
+  rotating file (and only optionally to stderr). Never add a stdout `StreamHandler`. Auth secrets/headers must
+  never be logged — the executor logs only method/FQDN/args(status); `SPECROUTER_LOG_ARGS=false` drops args.
+- **FastMCP runs sync tools inline on the event loop** (`func_metadata`: `await fn(...)` only if `fn` is a
+  coroutine). So a network call in a *sync* tool blocks every connected client during HTTP hosting. That's why
+  `execute_tool` is `async` (awaits `execute_to_json_async`); `discover_tools`/`refresh_index` stay sync
+  (CPU-only). Keep the executor's sync + async paths in lockstep via the shared `_prepare`/`_finalize`/`_map_exc`.
+- Detailed `custom` / `module:callable` adapter docs live in `docs/SOURCE_ADAPTERS.md` (README keeps only a
+  short pointer); update that page, not the README, when changing adapter behavior.
+- Adapters yield standard `EndpointRecord`s so `executor`/`discovery` stay unchanged; encode an API's quirks
+  in the adapter (path templates, query in the path, `body.wrapper_key` → single object param).
 - **Base URL:** `parser._resolve_base_url(spec, spec_url)` makes a relative `servers[]` URL (e.g. `/api/v3`)
   absolute by joining it to the spec's origin (only for http(s) spec sources). `executor` then uses
   `settings.base_url or bundle.base_url`, so `SPECROUTER_BASE_URL` overrides immediately without a rebuild.

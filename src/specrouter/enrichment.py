@@ -117,14 +117,18 @@ def _save_cache(settings: Settings, cache: dict[str, str]) -> None:
     path.write_text(json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def _extract_text(result: Any) -> str:
-    """Pull plain text from a LangChain message / string / list response."""
+def _extract_text(result: Any, *, collapse_whitespace: bool = True) -> str:
+    """Pull plain text from a LangChain message / string / list response.
+
+    ``collapse_whitespace=False`` preserves newlines (needed for YAML output).
+    """
     content = getattr(result, "content", result)
     if isinstance(content, list):  # some providers return content blocks
-        content = " ".join(
+        content = "".join(
             str(b.get("text", "")) if isinstance(b, dict) else str(b) for b in content
         )
-    return " ".join(str(content).split()).strip()
+    text = str(content)
+    return " ".join(text.split()).strip() if collapse_whitespace else text
 
 
 def enrich_records(records: list[EndpointRecord], settings: Settings) -> None:
@@ -146,6 +150,12 @@ def enrich_records(records: list[EndpointRecord], settings: Settings) -> None:
             _apply(rec, cache[h])
         else:
             misses.append(i)
+
+    logger.info(
+        "Enriching %d endpoints: %d cached, %d via LLM (%s/%s).",
+        len(records), len(records) - len(misses), len(misses),
+        settings.enrich_provider, settings.enrich_model,
+    )
 
     if misses:
         try:
@@ -173,15 +183,25 @@ def enrich_records(records: list[EndpointRecord], settings: Settings) -> None:
             logger.warning("Enrichment batch failed (%s); keeping original descriptions.", exc)
             results = [exc] * len(misses)
 
+        enriched = 0
+        failures = 0
         for idx, result in zip(misses, results):
             if isinstance(result, Exception):
+                failures += 1
                 logger.warning("Enrichment failed for %s: %s", records[idx].tool_name, result)
                 continue
             text = _extract_text(result)
             if not text:
+                failures += 1
                 continue
             cache[hashes[idx]] = text
             _apply(records[idx], text)
+            enriched += 1
+            logger.debug("Enriched %s", records[idx].tool_name)
+        logger.info(
+            "Enrichment complete: %d/%d rewritten, %d kept original.",
+            enriched, len(misses), failures,
+        )
 
     _save_cache(settings, cache)
 

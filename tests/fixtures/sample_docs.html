@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head><title>Widgets API</title></head>
+<body>
+  <h1>Widgets</h1>
+
+  <section class="operation">
+    <span class="http-method">GET</span>
+    <span class="endpoint-path">/widgets/{id}</span>
+    <p class="operation-summary">Get a widget by id</p>
+    <p class="operation-description">Returns a single widget resource.</p>
+    <table class="params"><tbody>
+      <tr><td class="param-name">id</td><td class="param-type">string</td><td class="param-required">yes</td><td class="param-in">path</td><td class="param-desc">Widget identifier</td></tr>
+      <tr><td class="param-name">verbose</td><td class="param-type">boolean</td><td class="param-required"></td><td class="param-in">query</td><td class="param-desc">Include extended fields</td></tr>
+    </tbody></table>
+  </section>
+
+  <section class="operation">
+    <span class="http-method">POST</span>
+    <span class="endpoint-path">/widgets</span>
+    <p class="operation-summary">Create a widget</p>
+    <p class="operation-description">Creates a new widget.</p>
+    <table class="params"><tbody>
+      <tr><td class="param-name">name</td><td class="param-type">string</td><td class="param-required">yes</td><td class="param-in">body</td><td class="param-desc">Widget name</td></tr>
+      <tr><td class="param-name">color</td><td class="param-type">string</td><td class="param-required"></td><td class="param-in">body</td><td class="param-desc">Widget color</td></tr>
+    </tbody></table>
+  </section>
+</body>
+</html>

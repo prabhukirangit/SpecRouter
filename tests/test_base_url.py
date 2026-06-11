@@ -47,9 +47,9 @@ def test_settings_base_url_overrides_frozen_bundle(bundle, monkeypatch):
         return httpx.Response(200, json={"ok": True})
 
     transport = httpx.MockTransport(handler)
-    real_client = httpx.Client
+    real_client = executor._CredScopedClient
     monkeypatch.setattr(
-        executor.httpx, "Client",
+        executor, "_CredScopedClient",
         lambda *a, **k: real_client(*a, **{**k, "transport": transport}),
     )
 

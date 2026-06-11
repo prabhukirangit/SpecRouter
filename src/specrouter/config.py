@@ -10,6 +10,10 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import httpx
 
 # --- BM25F field weights (W_c) and length-normalisation (b_c) -----------------
 # Defaults taken directly from usecase.md section 3.1. Each entry is (W_c, b_c).
@@ -67,6 +71,12 @@ class Settings:
     include_output_schema: bool = True
     output_schema_max_depth: int = 4  # cap $ref inlining depth to avoid bloat
 
+    # --- source adapter (documentation type) --------------------------------
+    # "openapi" (default) | "custom" (config-driven HTML scraper) | "module:callable".
+    source_adapter: str = "openapi"
+    custom_rules: str | None = None     # path to the custom-adapter rules file (YAML/JSON)
+    custom_concurrency: int = 8         # bounded parallel page fetches for the custom adapter
+
     # --- auth ---------------------------------------------------------------
     auth_mode: str = "none"
     bearer_token: str | None = None
@@ -87,13 +97,39 @@ class Settings:
     enrich_max_sentences: int = 4
 
     # --- networking ---------------------------------------------------------
-    request_timeout: float = 30.0
+    # httpx has no single total-request deadline, so these bound each phase:
+    # connect_timeout caps establishing the socket; request_timeout caps each
+    # read/write/pool wait. A slow upstream therefore fails with a 504 instead of
+    # blocking the caller (and, in HTTP hosting, the shared event loop) forever.
+    request_timeout: float = 60.0
+    connect_timeout: float = 10.0
+
+    # --- logging (rotating file handler) ------------------------------------
+    # Steps logged: indexing, enrichment progress, every discover_tools call, and each
+    # executed route (FQDN + args + status). File/stderr only — never stdout (stdio MCP).
+    log_dir: Path = field(default_factory=lambda: Path("logs"))
+    log_level: str = "INFO"
+    log_max_bytes: int = 5_000_000   # rotate at ~5 MB
+    log_backup_count: int = 5        # keep specrouter.log.1 .. .5
+    log_to_console: bool = False     # also echo to stderr (never stdout)
+    log_args: bool = True            # include execute_tool call arguments in the log line
+
+    def request_timeouts(self) -> "httpx.Timeout":
+        """Granular httpx timeout: ``connect_timeout`` for the connect phase,
+        ``request_timeout`` for each read/write/pool wait. httpx is imported lazily
+        so importing :class:`Settings` stays dependency-light."""
+        import httpx
+
+        return httpx.Timeout(self.request_timeout, connect=self.connect_timeout)
 
     def cache_key(self) -> str:
-        """Stable filesystem-safe key identifying this spec source."""
+        """Stable filesystem-safe key identifying this spec source + adapter type."""
         import hashlib
 
-        return hashlib.sha256(self.spec_url.encode("utf-8")).hexdigest()[:16]
+        # Include source_adapter so switching adapters for the same spec URL
+        # produces a separate cache file rather than silently reusing the old one.
+        key = f"{self.source_adapter}:{self.spec_url}"
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
     def index_path(self) -> Path:
         return self.cache_dir / f"{self.cache_key()}.index.pkl"
@@ -148,20 +184,25 @@ def _apply_dotenv(env: dict[str, str]) -> dict[str, str]:
     return merged
 
 
-def load_settings(env: dict[str, str] | None = None) -> Settings:
+def load_settings(env: dict[str, str] | None = None, *, require_spec_source: bool = True) -> Settings:
     """Build :class:`Settings` from the process environment (or an override dict).
 
     A ``.env`` file (``./.env`` or ``$SPECROUTER_ENV_FILE``) is loaded automatically;
-    real environment variables override file values.
+    real environment variables override file values. ``require_spec_source=False`` relaxes
+    the spec/adapter requirements for commands that only need the LLM config (``init-rules``).
     """
     env = dict(os.environ if env is None else env)
     env = _apply_dotenv(env)
 
+    source_adapter = (env.get("SPECROUTER_SOURCE_ADAPTER") or "openapi").strip()
     spec_url = env.get("SPECROUTER_SPEC_URL")
     if not spec_url:
-        raise ConfigError(
-            "SPECROUTER_SPEC_URL is required (URL or file:// path to the OpenAPI spec)."
-        )
+        if source_adapter == "openapi" and require_spec_source:
+            raise ConfigError(
+                "SPECROUTER_SPEC_URL is required (URL or file:// path to the OpenAPI spec)."
+            )
+        # Non-OpenAPI adapters source their own content; use a stable cache-key identifier.
+        spec_url = env.get("SPECROUTER_CUSTOM_RULES") or f"adapter:{source_adapter}"
 
     auth_mode = env.get("SPECROUTER_AUTH_MODE", "none").strip().lower()
     if auth_mode not in VALID_AUTH_MODES:
@@ -195,6 +236,9 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         fuzzy_weight_power=float(env.get("SPECROUTER_FUZZY_WEIGHT_POWER", "2.0")),
         include_output_schema=_get_bool(env, "SPECROUTER_INCLUDE_OUTPUT_SCHEMA", True),
         output_schema_max_depth=int(env.get("SPECROUTER_OUTPUT_SCHEMA_MAX_DEPTH", "4")),
+        source_adapter=source_adapter,
+        custom_rules=env.get("SPECROUTER_CUSTOM_RULES") or None,
+        custom_concurrency=int(env.get("SPECROUTER_CUSTOM_CONCURRENCY", "8")),
         auth_mode=auth_mode,
         bearer_token=env.get("SPECROUTER_BEARER_TOKEN") or None,
         api_key=env.get("SPECROUTER_API_KEY") or None,
@@ -203,7 +247,8 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         basic_pass=env.get("SPECROUTER_BASIC_PASS") or None,
         extra_headers=extra_headers,
         auth_plugin=env.get("SPECROUTER_AUTH_PLUGIN") or None,
-        request_timeout=float(env.get("SPECROUTER_REQUEST_TIMEOUT", "30")),
+        request_timeout=float(env.get("SPECROUTER_REQUEST_TIMEOUT", "60")),
+        connect_timeout=float(env.get("SPECROUTER_CONNECT_TIMEOUT", "10")),
         enrich=_get_bool(env, "SPECROUTER_ENRICH", False),
         enrich_provider=(env.get("SPECROUTER_ENRICH_PROVIDER") or "").strip().lower() or None,
         enrich_model=env.get("SPECROUTER_ENRICH_MODEL") or None,
@@ -211,11 +256,37 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         enrich_api_key=env.get("SPECROUTER_ENRICH_API_KEY") or None,
         enrich_concurrency=int(env.get("SPECROUTER_ENRICH_CONCURRENCY", "5")),
         enrich_max_sentences=int(env.get("SPECROUTER_ENRICH_MAX_SENTENCES", "4")),
+        log_dir=Path(env.get("SPECROUTER_LOG_DIR", "logs")),
+        log_level=(env.get("SPECROUTER_LOG_LEVEL", "INFO") or "INFO").strip().upper(),
+        log_max_bytes=int(env.get("SPECROUTER_LOG_MAX_BYTES", "5000000")),
+        log_backup_count=int(env.get("SPECROUTER_LOG_BACKUP_COUNT", "5")),
+        log_to_console=_get_bool(env, "SPECROUTER_LOG_CONSOLE", False),
+        log_args=_get_bool(env, "SPECROUTER_LOG_ARGS", True),
     )
 
     _validate_auth(settings)
     _validate_enrich(settings)
+    if require_spec_source:
+        _validate_source(settings)
     return settings
+
+
+def _validate_source(s: Settings) -> None:
+    """Fail fast when the selected source adapter is misconfigured."""
+    spec = s.source_adapter
+    if spec in ("openapi",) or ":" in spec:
+        return  # openapi needs spec_url (checked earlier); plugin shape checked at resolve time
+    if spec == "custom":
+        if not s.custom_rules:
+            raise ConfigError(
+                "SPECROUTER_SOURCE_ADAPTER=custom requires SPECROUTER_CUSTOM_RULES "
+                "(path to a YAML/JSON rules file)."
+            )
+        return
+    raise ConfigError(
+        f"SPECROUTER_SOURCE_ADAPTER='{spec}' is not a built-in adapter "
+        "('openapi'|'custom') or a 'module:callable' plugin."
+    )
 
 
 def _validate_auth(s: Settings) -> None:

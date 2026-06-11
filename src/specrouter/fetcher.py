@@ -63,7 +63,7 @@ def _read_file(url: str) -> bytes:
     return Path(path).read_bytes()
 
 
-def fetch_spec(url: str, *, timeout: float = 30.0) -> FetchResult:
+def fetch_spec(url: str, *, timeout: float | httpx.Timeout = 30.0) -> FetchResult:
     """Download and parse the spec, capturing change-detection metadata."""
     if _is_file_url(url):
         raw = _read_file(url)
@@ -81,7 +81,7 @@ def fetch_spec(url: str, *, timeout: float = 30.0) -> FetchResult:
         )
 
 
-def head_meta(url: str, *, timeout: float = 30.0) -> RemoteMeta | None:
+def head_meta(url: str, *, timeout: float | httpx.Timeout = 30.0) -> RemoteMeta | None:
     """Cheap HEAD probe for ETag/Last-Modified. Returns None when unavailable."""
     if _is_file_url(url):
         return None

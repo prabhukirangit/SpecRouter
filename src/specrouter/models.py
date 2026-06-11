@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 # Field names used by BM25F. Must align with config.DEFAULT_FIELD_WEIGHTS keys.
 FIELD_NAMES = ("operation_id", "summary", "tags", "path", "parameters", "description")
+
+# Shared regex for OpenAPI path-parameter templates like {id} or {user_id}.
+PATH_PARAM_RE = re.compile(r"\{([^}]+)\}")
 
 
 @dataclass

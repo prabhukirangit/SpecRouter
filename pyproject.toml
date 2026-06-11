@@ -13,7 +13,7 @@ authors = [{ name = "Prabhukiran Ganapavarapu" }]
 keywords = ["mcp", "openapi", "swagger", "bm25", "llm", "tools", "retrieval"]
 dependencies = [
     "mcp>=1.2.0",
-    "httpx>=0.27",
+    "httpx>=0.27,<2",
     "PyYAML>=6.0",
 ]
 
@@ -21,7 +21,12 @@ dependencies = [
 # Optional accelerator: only the Levenshtein (fuzzy) stage uses it; results are identical
 # whether or not rapidfuzz is installed. Default install stays pure-stdlib / infra-free.
 fast = ["rapidfuzz>=3.0"]
-dev = ["pytest>=7.0", "pytest-asyncio>=0.23", "mcp[cli]>=1.2.0"]
+# HTML scraping for the 'custom' source adapter (config-driven doc-site ingestion).
+scrape = ["beautifulsoup4>=4.12", "lxml>=5.0"]
+# Local "Acme Product Catalog" demo API (~100 endpoints) — see demo/README.md. Used only to
+# record/try a live SpecRouter session; never imported by the core package.
+demo = ["fastapi>=0.110", "uvicorn>=0.27"]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.23", "mcp[cli]>=1.2.0", "beautifulsoup4>=4.12", "lxml>=5.0"]
 
 # Optional AI description enrichment (build-time only). Pick the provider you use;
 # the runtime stays zero-ML — enrichment never runs during discovery/execution.

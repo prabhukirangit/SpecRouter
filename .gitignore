@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project-internal docs (not for the public repo)
+CLAUDE.md
+usecase.md
+plan.md
+
+# Runtime logs (*.log is already ignored above)
+logs/

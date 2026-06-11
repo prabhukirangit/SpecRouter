@@ -8,26 +8,26 @@ admin tool — so the build/persist/refresh logic lives in exactly one place.
 from __future__ import annotations
 
 import json
+import logging
 import pickle
 from datetime import datetime, timezone
 
-from . import fetcher
+from .adapters import SourceResult, resolve_adapter
 from .config import Settings
 from .engines import bm25f
 from .models import IndexBundle
-from .parser import parse_spec
+
+logger = logging.getLogger(__name__)
 
 # Bump when the pickled IndexBundle layout changes, to invalidate stale caches.
-INDEX_FORMAT_VERSION = 3
+INDEX_FORMAT_VERSION = 4
 
 
-def build_index(settings: Settings, fetched: fetcher.FetchResult) -> IndexBundle:
-    """Parse a freshly fetched spec into a primed, ready-to-serve IndexBundle."""
-    records, base_url = parse_spec(
-        fetched.spec,
-        base_url_override=settings.base_url,
-        output_schema_max_depth=settings.output_schema_max_depth,
-        spec_url=settings.spec_url,
+def build_index(settings: Settings, result: SourceResult) -> IndexBundle:
+    """Assemble a primed, ready-to-serve IndexBundle from an adapter's SourceResult."""
+    records = result.records
+    logger.info(
+        "Building index from %d records (enrichment=%s)", len(records), settings.enrich
     )
     if settings.enrich:
         # Build-time only: rewrites descriptions, then priming indexes the new text.
@@ -36,10 +36,10 @@ def build_index(settings: Settings, fetched: fetcher.FetchResult) -> IndexBundle
         enrichment.enrich_records(records, settings)
     bundle = IndexBundle(
         records=records,
-        base_url=base_url,
-        source_hash=fetched.content_hash,
-        etag=fetched.etag,
-        last_modified=fetched.last_modified,
+        base_url=result.base_url,
+        source_hash=result.source_hash,
+        etag=result.etag,
+        last_modified=result.last_modified,
         built_at=datetime.now(timezone.utc).isoformat(),
         spec_url=settings.spec_url,
     )
@@ -62,10 +62,20 @@ def save_index(settings: Settings, bundle: IndexBundle) -> None:
         "endpoint_count": bundle.endpoint_count(),
     }
     settings.meta_path().write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    logger.info(
+        "Saved index -> %s (%d endpoints, hash %s)",
+        settings.index_path(), bundle.endpoint_count(), bundle.source_hash[:12],
+    )
 
 
 def load_index(settings: Settings) -> IndexBundle | None:
-    """Load a cached bundle if present and version-compatible, else None."""
+    """Load a cached bundle if present and version-compatible, else None.
+
+    Security note: the cache is a pickle written by this process into
+    ``SPECROUTER_CACHE_DIR`` (``~/.specrouter`` by default). Unpickling executes
+    arbitrary code, so the cache directory must be trusted/owner-writable — do not
+    point ``SPECROUTER_CACHE_DIR`` at a world-writable or shared location.
+    """
     path = settings.index_path()
     if not path.exists():
         return None
@@ -80,44 +90,34 @@ def load_index(settings: Settings) -> IndexBundle | None:
     return bundle if isinstance(bundle, IndexBundle) else None
 
 
-def _is_fresh(settings: Settings, cached: IndexBundle) -> bool:
-    """Decide whether the cached index still matches the remote spec.
-
-    Cheap path: a HEAD probe comparing ETag / Last-Modified. If the server gives
-    us neither, fall through and report stale so the caller re-fetches the body
-    and compares content hashes.
-    """
-    meta = fetcher.head_meta(settings.spec_url, timeout=settings.request_timeout)
-    if meta is None:
-        return False
-    if meta.etag and cached.etag:
-        return meta.etag == cached.etag
-    if meta.last_modified and cached.last_modified:
-        return meta.last_modified == cached.last_modified
-    return False
-
-
 def ensure_index(settings: Settings, *, force: bool = False) -> IndexBundle:
-    """Return a ready index, rebuilding + persisting only when the spec changed.
+    """Return a ready index, rebuilding + persisting only when the source changed.
 
-    - ``force=True`` always re-fetches and rebuilds (used by ``refresh_index``).
-    - Otherwise: load cache; if a cheap HEAD probe proves it fresh, reuse it;
-      else fetch the full body and rebuild only if the content hash differs.
+    Works through the selected source adapter (``SPECROUTER_SOURCE_ADAPTER``):
+    - ``force=True`` always re-loads and rebuilds (used by ``refresh_index``).
+    - Otherwise: load cache; if the adapter's cheap freshness check passes, reuse it;
+      else re-load the source and rebuild only if the content hash differs.
     """
+    adapter = resolve_adapter(settings)
+    logger.info("ensure_index: adapter=%s force=%s", adapter.name, force)
     cached = None if force else load_index(settings)
 
-    if cached is not None and _is_fresh(settings, cached):
+    if cached is not None and adapter.is_fresh(settings, cached):
+        logger.info("Index is fresh (cache hit, %d endpoints) — reusing.", cached.endpoint_count())
         return cached
 
-    fetched = fetcher.fetch_spec(settings.spec_url, timeout=settings.request_timeout)
+    logger.info("Loading source via '%s' adapter...", adapter.name)
+    result = adapter.load(settings)
 
-    if cached is not None and not force and fetched.content_hash == cached.source_hash:
-        # Body unchanged after all (HEAD lacked validators) — refresh validators only.
-        cached.etag = fetched.etag or cached.etag
-        cached.last_modified = fetched.last_modified or cached.last_modified
+    if cached is not None and not force and result.source_hash == cached.source_hash:
+        # Source unchanged after all (cheap check lacked validators) — refresh validators only.
+        logger.info("Source unchanged (hash match) - keeping cached index.")
+        cached.etag = result.etag or cached.etag
+        cached.last_modified = result.last_modified or cached.last_modified
         save_index(settings, cached)
         return cached
 
-    bundle = build_index(settings, fetched)
+    logger.info("Source changed or rebuild forced - rebuilding index.")
+    bundle = build_index(settings, result)
     save_index(settings, bundle)
     return bundle

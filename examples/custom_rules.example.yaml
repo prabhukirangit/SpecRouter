@@ -1,0 +1,51 @@
+# Example rules file for the 'custom' source adapter.
+#
+# Use it with:
+#   SPECROUTER_SOURCE_ADAPTER=custom
+#   SPECROUTER_CUSTOM_RULES=./examples/custom_rules.example.yaml
+#   SPECROUTER_BASE_URL=https://api.example.com      # the API host execute_tool calls
+#
+# The adapter fetches static HTML pages and converts table/section-based API docs into
+# discoverable + executable tools. All selectors are standard CSS selectors.
+
+# Base URL for live execution. SPECROUTER_BASE_URL overrides this at execution time.
+base_url: "https://api.example.com"
+
+pages:
+  # Option A: crawl an index page for links to per-resource doc pages.
+  index_url: "https://docs.example.com/api/"
+  link_selector: "a.resource-link"      # anchors pointing to resource pages
+  link_attr: "href"                     # attribute holding the URL (default: href)
+  # Option B (instead of index_url/link_selector): list pages explicitly.
+  # urls:
+  #   - "https://docs.example.com/api/widgets.html"
+  #   - "https://docs.example.com/api/gadgets.html"
+
+operation:
+  # Each operation on a page is one block matched by block_selector.
+  # Omit block_selector if a page documents a single operation.
+  block_selector: "section.operation"
+  method_selector: ".http-method"       # text like "POST" (verb is auto-extracted)
+  # method_attr: "data-method"          # read an attribute instead of text
+  path_selector: ".endpoint-path"       # e.g. /widgets/{id}  (path params auto-detected)
+  summary_selector: ".operation-summary"
+  description_selector: ".operation-description"
+  # tags_selector: ".category"
+
+params:
+  # scope: "operation" (default) reads the table inside each operation block;
+  # scope: "page" reads one shared table per page and applies it to every operation.
+  scope: "operation"
+  row_selector: "table.params tbody tr"
+  name_selector: "td.param-name"
+  type_selector: "td.param-type"        # int/bool/number/array/object/string (normalized)
+  required_selector: "td.param-required"
+  required_match: "yes"                 # text meaning "required" (optional)
+  in_selector: "td.param-in"            # path|query|header|body (optional; else inferred)
+  description_selector: "td.param-desc"
+
+body:
+  # If the API wraps the request body under a key (e.g. {"widget": {...}}), set it here.
+  # Body fields are then collapsed into a single object parameter named after the key,
+  # so the executor sends the wrapped shape with no code changes. Leave null for flat bodies.
+  wrapper_key: null

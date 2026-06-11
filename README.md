@@ -75,6 +75,7 @@ python -m venv .venv
 pip install -e ".[fast]"      # or ".[dev,fast]" to also run the tests
 
 cp .env.example .env          # edit .env and set SPECROUTER_SPEC_URL
+specrouter index 
 specrouter serve              # start the MCP server (stdio)
 ```
 
@@ -85,6 +86,13 @@ specrouter serve              # start the MCP server (stdio)
 | `pip install -e .` | pure-stdlib, infrastructure-free default |
 | `pip install -e ".[fast]"` | + `rapidfuzz` accelerator for the fuzzy stage |
 | `pip install -e ".[dev]"` | + `pytest` for the test suite |
+| `pip install -e ".[demo]"` | + `fastapi`/`uvicorn` for the local demo catalog API |
+
+### Try it locally (live demo)
+
+Want to see discovery + execution end to end without wiring up a real API? Spin up the bundled
+**Acme Product Catalog** — a local FastAPI server with ~100 product endpoints across 10 categories —
+point SpecRouter at it, and attach it to Claude Code / VS Code. See **[demo/README.md](demo/README.md)**.
 
 ## Configuration via `.env`
 
@@ -113,7 +121,14 @@ At minimum set `SPECROUTER_SPEC_URL`. See the full variable table below.
 | `SPECROUTER_FUZZY_WEIGHT_POWER` | `2.0` | Fuzzy contribution = `similarity ** power`; higher = stricter. |
 | `SPECROUTER_INCLUDE_OUTPUT_SCHEMA` | `true` | Emit a separate `outputSchema` (primary 2xx response) per tool. |
 | `SPECROUTER_OUTPUT_SCHEMA_MAX_DEPTH` | `4` | Cap `$ref` inlining depth in `outputSchema` to avoid bloat. |
-| `SPECROUTER_REQUEST_TIMEOUT` | `30` | HTTP timeout (seconds). |
+| `SPECROUTER_REQUEST_TIMEOUT` | `60` | Per-phase read/write/pool timeout (seconds) for each upstream call. |
+| `SPECROUTER_CONNECT_TIMEOUT` | `10` | Timeout (seconds) to establish the connection. A slow/unreachable upstream returns a `504`/`502` instead of hanging. |
+| `SPECROUTER_LOG_DIR` | `logs` | Directory for the rotating `specrouter.log` (see [Logging](#logging)). |
+| `SPECROUTER_LOG_LEVEL` | `INFO` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR`. |
+| `SPECROUTER_LOG_MAX_BYTES` | `5000000` | Rotate the log at ~5 MB. |
+| `SPECROUTER_LOG_BACKUP_COUNT` | `5` | Rotated backups to keep. |
+| `SPECROUTER_LOG_CONSOLE` | `false` | Also echo logs to stderr (never stdout). |
+| `SPECROUTER_LOG_ARGS` | `true` | Include `execute_tool` call args in the audit line. |
 
 ### Auth (applied to `execute_tool` calls)
 
@@ -151,12 +166,28 @@ SPECROUTER_SPEC_URL=https://docs.example.com/openapi.json
 SPECROUTER_BASE_URL=https://api.example.com/v2     # execute_tool calls go here
 ```
 
+## Source adapters (not just OpenAPI)
+
+Out of the box SpecRouter ingests an OpenAPI/Swagger spec, but the source is pluggable via
+`SPECROUTER_SOURCE_ADAPTER`:
+
+| Value | Ingests |
+| --- | --- |
+| `openapi` *(default)* | An OpenAPI 3 / Swagger 2 spec (`SPECROUTER_SPEC_URL`). |
+| `custom` | A static **HTML doc site**, via a CSS-selector rules file you generate with `specrouter init-rules`. |
+| `module:callable` | Your own adapter for any other source. |
+
+Got an API documented as HTML pages instead of a spec? `specrouter init-rules <doc-url>` has an LLM write the
+scraper rules for you. **→ See [docs/SOURCE_ADAPTERS.md](docs/SOURCE_ADAPTERS.md)** for the `custom` and
+`module:callable` adapters.
+
 ## CLI
 
 ```bash
-specrouter index     # prebuild + persist the index, then exit (the upfront build script)
-specrouter serve     # start the MCP server over stdio (builds on demand if no fresh cache)
-specrouter refresh   # force a re-fetch + rebuild + persist, out of band
+specrouter index       # prebuild + persist the index, then exit (the upfront build script)
+specrouter serve       # start the MCP server over stdio (builds on demand if no fresh cache)
+specrouter refresh     # force a re-fetch + rebuild + persist, out of band
+specrouter init-rules <doc-url>   # LLM-generate a custom-adapter rules file (see Source adapters)
 
 # Host it as a network service for remote clients:
 specrouter serve --transport streamable-http --host 0.0.0.0 --port 8000
@@ -172,6 +203,17 @@ specrouter serve --transport streamable-http --host 0.0.0.0 --port 8000
   server offers no validators, the body is fetched and compared by SHA-256 content hash. The index is rebuilt
   **only when the spec actually changed.**
 - **Manual refresh.** Call the `refresh_index` MCP tool or run `specrouter refresh` to force a rebuild.
+
+## Logging
+
+SpecRouter writes a single **rotating log file** (`./logs/specrouter.log` by default) covering every step:
+indexing, enrichment progress, each `discover_tools` call, and every executed route with its **FQDN +
+arguments + response code**. It's configured automatically for every CLI command and the server — no setup.
+Logs go to a file (and optionally stderr), **never stdout**, so the MCP stdio protocol stays clean. Auth
+secrets are never logged.
+
+**→ See [docs/LOGGING.md](docs/LOGGING.md)** for the full event list, log levels, rotation, and the
+`SPECROUTER_LOG_*` settings.
 
 ## Performance: the optional `[fast]` accelerator
 
@@ -356,15 +398,17 @@ The MCP endpoint is then `http://<host>:8000/mcp` (streamable-http) or `http://<
 Run it under a process manager (systemd, Docker, supervisor) and, for anything beyond localhost, **front it
 with HTTPS + auth** (see the security note below).
 
-Example `Dockerfile`:
+Example `Dockerfile` (copies only the package, not your local `.venv`):
 
 ```dockerfile
 FROM python:3.12-slim
 WORKDIR /app
-COPY . .
+COPY pyproject.toml README.md ./
+COPY src ./src
 RUN pip install --no-cache-dir ".[fast]"
-ENV SPECROUTER_SPEC_URL=""
 EXPOSE 8000
+# Provide config at run time, e.g.:
+#   docker run -p 8000:8000 -e SPECROUTER_SPEC_URL=https://api.example.com/openapi.json <image>
 CMD ["specrouter", "serve", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
@@ -427,6 +471,11 @@ credentials. Anyone who can reach the MCP endpoint can invoke those calls. When 
 - Treat the host's `SPECROUTER_*` auth credentials as secrets (env/secret manager, not committed).
 - Consider a least-privilege downstream token, since every connected client shares the server's identity.
 
+`execute_tool` follows redirects but **drops injected credential headers** (the api-key header and
+`SPECROUTER_EXTRA_HEADERS`) whenever a downstream redirects to a different origin, so a misbehaving API can't
+bounce your secrets to another host. The on-disk index cache is a pickle written by the server — keep
+`SPECROUTER_CACHE_DIR` owner-writable (not a shared/world-writable path).
+
 ## Tests
 
 ```bash
@@ -437,3 +486,11 @@ Covers tokenizer normalization, each engine, parser `$ref` resolution, end-to-en
 typo case), executor parameter routing, all auth modes (httpx mocked), output-schema extraction/inlining, and
 description enrichment (with a fake LLM — no network or provider deps). The stdlib/rapidfuzz parity test is
 skipped automatically when `rapidfuzz` is not installed.
+
+## Demo
+
+<video src="demo/demo_specrouter.mp4" controls width="100%"></video>
+
+## Author
+
+Prabhukiran Ganapavarapu — [github.com/prabhukirangit](https://github.com/prabhukirangit)

@@ -6,12 +6,15 @@ emits MCP-shaped tool schemas for the winning endpoints (usecase.md section 4, T
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from .config import Settings
 from .engines import bm25f, jaccard, levenshtein, rrf
 from .models import EndpointRecord, IndexBundle
 from .tokenizer import tokenize
+
+logger = logging.getLogger(__name__)
 
 _JSON_TYPES = {"integer", "number", "string", "boolean", "array", "object"}
 
@@ -42,6 +45,11 @@ def discover(query: str, bundle: IndexBundle, settings: Settings) -> dict[str, A
     )
 
     tools = [_to_tool_schema(records[idx], settings) for idx, _score in ranked]
+    if logger.isEnabledFor(logging.INFO):
+        logger.info(
+            "discover q=%r -> %s (%d/%d)",
+            query, [t["name"] for t in tools], len(tools), len(records),
+        )
     return {"tools": tools}
 
 

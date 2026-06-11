@@ -8,21 +8,62 @@ parameter spec, applies auth, executes the request, and returns a wrapped JSON r
 from __future__ import annotations
 
 import json
-import re
-from typing import Any
+import logging
+from typing import Any, NamedTuple
 
 import httpx
 
 from .auth import apply_auth
 from .config import Settings
-from .models import EndpointRecord, IndexBundle
+from .models import EndpointRecord, IndexBundle, PATH_PARAM_RE as _PATH_PARAM
 
-_PATH_PARAM = re.compile(r"\{([^}]+)\}")
+logger = logging.getLogger(__name__)
 _BODY_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
 class ExecutionError(Exception):
     """Raised for client-side problems (unknown route, missing required params)."""
+
+
+def _same_origin(a: httpx.URL, b: httpx.URL) -> bool:
+    return (a.scheme, a.host, a.port) == (b.scheme, b.host, b.port)
+
+
+class _CredScopedMixin:
+    """Mixin for httpx clients that drops SpecRouter-injected credential headers when a
+    response redirects to a *different origin*.
+
+    httpx already strips ``Authorization``/``Cookie`` across origins, but it does not
+    know about custom secret headers — the configured api-key header or user-supplied
+    ``extra_headers``. Without this, a downstream that 3xx-redirects off-origin would
+    leak those secrets to the new host. Same-origin redirects keep the headers so
+    legitimate trailing-slash / http→https hops still work.
+
+    ``_redirect_headers`` lives on ``httpx.BaseClient`` (shared by ``Client`` and
+    ``AsyncClient``), so this single override serves both the sync and async clients.
+    """
+
+    def __init__(
+        self, *args: Any, sensitive_headers: set[str] | None = None, **kwargs: Any
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._sensitive = {h.lower() for h in (sensitive_headers or set())}
+
+    def _redirect_headers(self, request: httpx.Request, url: httpx.URL, method: str) -> Any:
+        headers = super()._redirect_headers(request, url, method)
+        if self._sensitive and not _same_origin(url, request.url):
+            for name in [h for h in headers if h.lower() in self._sensitive]:
+                del headers[name]
+        return headers
+
+
+class _CredScopedClient(_CredScopedMixin, httpx.Client):
+    """Synchronous credential-scoped client (CLI / direct ``execute`` callers)."""
+
+
+class _CredScopedAsyncClient(_CredScopedMixin, httpx.AsyncClient):
+    """Async credential-scoped client used by the ``execute_tool`` request path so a
+    slow upstream never blocks the FastMCP event loop (which runs sync tools inline)."""
 
 
 def _find_record(bundle: IndexBundle, path: str, method: str) -> EndpointRecord | None:
@@ -90,14 +131,29 @@ def _build_url(base_url: str | None, path: str, path_args: dict[str, Any]) -> st
     )
 
 
-def execute(
+class _Prepared(NamedTuple):
+    """The pure, I/O-free product of request preparation, shared by sync + async paths."""
+
+    method: str
+    url: str
+    request_kwargs: dict[str, Any]
+    auth: Any
+    sensitive: set[str]
+    arguments: dict[str, Any]
+
+
+def _prepare(
     path: str,
     method: str,
     arguments: dict[str, Any] | None,
     bundle: IndexBundle,
     settings: Settings,
-) -> dict[str, Any]:
-    """Execute the HTTP call and return ``{status, contentType, content}``."""
+) -> _Prepared:
+    """Resolve the endpoint, classify args, build the URL + request kwargs + auth.
+
+    Pure (no network); shared verbatim by the sync and async execute paths so the two
+    can never drift in how they map arguments or apply auth.
+    """
     arguments = arguments or {}
     method = method.upper()
 
@@ -128,15 +184,101 @@ def execute(
     request_kwargs = apply_auth(request_kwargs, settings)
     auth = request_kwargs.pop("auth", None)
 
-    with httpx.Client(timeout=settings.request_timeout, follow_redirects=True) as client:
-        resp = client.request(auth=auth, **request_kwargs)
+    # Secret headers httpx won't strip on its own (it only handles Authorization/Cookie):
+    # the api-key header and any user extra_headers. Drop them on cross-origin redirects.
+    sensitive: set[str] = set(settings.extra_headers)
+    if settings.auth_mode == "api_key":
+        sensitive.add(settings.api_key_header)
 
-    content_type = resp.headers.get("content-type", "")
+    return _Prepared(method, url, request_kwargs, auth, sensitive, arguments)
+
+
+def _finalize(resp: httpx.Response, prep: _Prepared, settings: Settings) -> dict[str, Any]:
+    """Emit the audit log line and wrap the response as ``{status, contentType, content}``."""
+    if logger.isEnabledFor(logging.INFO):
+        args_part = f" args={prep.arguments}" if settings.log_args else ""
+        logger.info("EXEC %s %s%s -> %s", prep.method, prep.url, args_part, resp.status_code)
     return {
         "status": resp.status_code,
-        "contentType": content_type,
+        "contentType": resp.headers.get("content-type", ""),
         "content": resp.text,
     }
+
+
+def execute(
+    path: str,
+    method: str,
+    arguments: dict[str, Any] | None,
+    bundle: IndexBundle,
+    settings: Settings,
+) -> dict[str, Any]:
+    """Execute the HTTP call synchronously and return ``{status, contentType, content}``."""
+    prep = _prepare(path, method, arguments, bundle, settings)
+    with _CredScopedClient(
+        timeout=settings.request_timeouts(),
+        follow_redirects=True,
+        sensitive_headers=prep.sensitive,
+    ) as client:
+        resp = client.request(auth=prep.auth, **prep.request_kwargs)
+    return _finalize(resp, prep, settings)
+
+
+async def execute_async(
+    path: str,
+    method: str,
+    arguments: dict[str, Any] | None,
+    bundle: IndexBundle,
+    settings: Settings,
+) -> dict[str, Any]:
+    """Async twin of :func:`execute`: awaits the upstream call so a slow API never
+    blocks the FastMCP event loop (and therefore other connected clients)."""
+    prep = _prepare(path, method, arguments, bundle, settings)
+    async with _CredScopedAsyncClient(
+        timeout=settings.request_timeouts(),
+        follow_redirects=True,
+        sensitive_headers=prep.sensitive,
+    ) as client:
+        resp = await client.request(auth=prep.auth, **prep.request_kwargs)
+    return _finalize(resp, prep, settings)
+
+
+def _error_response(status: int, message: str) -> str:
+    """A structured failure the client LLM can read directly.
+
+    ``error`` is surfaced at the top level (its presence unambiguously signals failure),
+    while ``content`` mirrors the success shape (always a string) so a single parser
+    handles both. ``status`` carries an HTTP-style code the model already understands.
+    """
+    return json.dumps({
+        "status": status,
+        "contentType": "application/json",
+        "content": json.dumps({"error": message}),
+        "error": message,
+    })
+
+
+def _map_exc(exc: Exception, method: str, path: str, settings: Settings) -> str:
+    """Map an execute() exception to a structured ``{status, error, content}`` JSON string.
+
+    Shared by the sync and async wrappers so their failure contract can't drift:
+      - **400** invalid request (unknown route, missing required/path params, no base URL)
+      - **504** upstream timeout    - **502** other upstream/transport failure
+      - **500** unexpected internal error (bad URL, auth-plugin failure, …)
+    """
+    if isinstance(exc, ExecutionError):
+        logger.warning("EXEC %s %s failed (client): %s", method, path, exc)
+        return _error_response(400, str(exc))
+    if isinstance(exc, httpx.TimeoutException):
+        logger.warning("EXEC %s %s timed out: %s", method, path, exc)
+        # ConnectTimeout fires at connect_timeout; all other phases use request_timeout.
+        timeout_val = settings.connect_timeout if isinstance(exc, httpx.ConnectTimeout) else settings.request_timeout
+        return _error_response(504, f"Upstream request timed out after {timeout_val}s: {exc}")
+    if isinstance(exc, httpx.HTTPError):
+        logger.warning("EXEC %s %s failed (upstream): %s", method, path, exc)
+        return _error_response(502, f"Upstream request failed: {exc}")
+    # InvalidURL, auth-plugin errors, anything unexpected.
+    logger.exception("EXEC %s %s failed (unexpected)", method, path)
+    return _error_response(500, f"Internal error executing the request: {exc}")
 
 
 def execute_to_json(
@@ -146,12 +288,26 @@ def execute_to_json(
     bundle: IndexBundle,
     settings: Settings,
 ) -> str:
-    """Convenience wrapper returning a JSON string (errors wrapped, never raised)."""
+    """Synchronous: return a JSON string for ``execute_tool``; failures are wrapped, never
+    raised, so the client LLM always gets a comprehensible ``{status, error, content}``
+    object instead of an opaque tool crash. Genuine upstream 4xx/5xx responses are passed
+    through untouched with their real status."""
     try:
         return json.dumps(execute(path, method, arguments, bundle, settings))
-    except ExecutionError as exc:
-        return json.dumps({"status": 400, "contentType": "application/json",
-                           "content": json.dumps({"error": str(exc)})})
-    except httpx.HTTPError as exc:
-        return json.dumps({"status": 502, "contentType": "application/json",
-                           "content": json.dumps({"error": f"Upstream request failed: {exc}"})})
+    except Exception as exc:
+        return _map_exc(exc, method, path, settings)
+
+
+async def execute_to_json_async(
+    path: str,
+    method: str,
+    arguments: dict[str, Any] | None,
+    bundle: IndexBundle,
+    settings: Settings,
+) -> str:
+    """Async twin of :func:`execute_to_json` used by the ``execute_tool`` MCP tool, so the
+    event loop stays free during the upstream call. Same wrapped failure contract."""
+    try:
+        return json.dumps(await execute_async(path, method, arguments, bundle, settings))
+    except Exception as exc:
+        return _map_exc(exc, method, path, settings)
