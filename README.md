@@ -44,7 +44,7 @@ the relevant token-length band, and can be disabled via `SPECROUTER_FUZZY_EXPAND
 
 All engines are pure stdlib. See **Performance** below for the optional `[fast]` accelerator.
 
-### Why not RAG / embeddings?
+### Why not RAG / embeddings search in discovery phase?
 
 Embedding-based retrieval is the default mental model for "semantic search", but for API endpoint discovery it trades real problems for theoretical benefits:
 
